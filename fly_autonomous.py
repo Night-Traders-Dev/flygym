@@ -36,6 +36,7 @@ from biome import (
 )
 from biome_effects import BiomeEffectsEngine
 from fly_vitals import VitalsManager
+from flight import FlightController
 
 MAX_FOOD = 15
 
@@ -152,17 +153,28 @@ def make_fly(name):
     fly = Fly(name=name)
     skeleton = Skeleton(
         axis_order=AxisOrder.YAW_PITCH_ROLL,
-        joint_preset=JointPreset.LEGS_ONLY,
+        joint_preset=JointPreset.ALL_BIOLOGICAL,  # includes wing joints
     )
     fly.add_joints(skeleton, neutral_pose=KinematicPosePreset.NEUTRAL)
-    actuated_dofs = skeleton.get_actuated_dofs_from_preset(
+
+    # Leg actuators (position control for walking)
+    leg_dofs = skeleton.get_actuated_dofs_from_preset(
         ActuatedDOFPreset.LEGS_ACTIVE_ONLY
     )
     fly.add_actuators(
-        actuated_dofs, ActuatorType.POSITION,
+        leg_dofs, ActuatorType.POSITION,
         kp=150.0, neutral_input=KinematicPosePreset.NEUTRAL,
         ctrlrange=(-3.14, 3.14),
     )
+
+    # Wing actuators (motor control for flight — direct torque)
+    wing_dofs = [d for d in skeleton.iter_jointdofs() if "wing" in d.name]
+    fly.add_actuators(
+        wing_dofs, ActuatorType.POSITION,
+        kp=20.0,
+        ctrlrange=(-3.14, 3.14),
+    )
+
     fly.add_leg_adhesion()
     fly.colorize()
     return fly
@@ -256,7 +268,12 @@ def main() -> int:
 
     # Vitals
     vitals_mgr = VitalsManager([fly.name for fly in flies])
-    flies_that_ate = set()  # tracks who ate this tick
+    flies_that_ate = set()
+
+    # Flight controllers
+    flight_ctrls = {}
+    for fly in flies:
+        flight_ctrls[fly.name] = FlightController(sim, fly.name, fly, timestep)
 
     # Viewer
     viewer = mjviewer.launch_passive(
@@ -314,28 +331,66 @@ def main() -> int:
                         fly.name, np.ones(6, dtype=bool) * am
                     )
 
-            # --- Turning toward food ---
+            # --- Navigation + flight/walk decision ---
             if step_count % turn_update_steps == 0:
                 food_pos = food_mgr.get_active_positions()
                 for fly in flies:
                     bp = sim.get_body_positions(fly.name)
                     xy = bp[0, :2]
+                    v = vitals_mgr.get(fly.name)
+                    fc = flight_ctrls[fly.name]
+
+                    # Compute direction to nearest food
+                    food_dir = None
+                    food_dist = 999
                     if len(food_pos) > 0:
                         dists = np.linalg.norm(food_pos - xy, axis=1)
+                        food_dist = dists.min()
                         to_food = food_pos[np.argmin(dists)] - xy
+                        food_dir = to_food / (np.linalg.norm(to_food) + 1e-8)
+
                         rot = sim.get_body_rotations(fly.name)
                         q = rot[0]
-                        fx = 1 - 2 * (q[2] ** 2 + q[3] ** 2)
-                        fy = 2 * (q[1] * q[2] + q[0] * q[3])
+                        fx = 1 - 2 * (q[2]**2 + q[3]**2)
+                        fy = 2 * (q[1]*q[2] + q[0]*q[3])
                         cross = fx * to_food[1] - fy * to_food[0]
                         turn_biases[fly.name] = np.clip(cross * 0.15, -0.8, 0.8)
                     else:
                         turn_biases[fly.name] = rng.uniform(-0.3, 0.3)
 
-            # --- Walk ---
+                    # Flight decision: fly if food is far and energy is adequate
+                    should_fly = (
+                        food_dist > 8.0
+                        and v.energy > 30
+                        and v.hunger < 50
+                        and v.alive
+                    )
+
+                    if should_fly and not fc.is_flying:
+                        fc.start_flying()
+                    elif (not should_fly or food_dist < 3.0) and fc.is_flying:
+                        fc.stop_flying()
+
+            # --- Walk or fly ---
             for fly in flies:
-                angles = controllers[fly.name].step(turn_biases[fly.name])
-                sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
+                fc = flight_ctrls[fly.name]
+                if fc.is_flying:
+                    # Flight mode: wing controller + aerodynamics
+                    move_dir = None
+                    food_pos = food_mgr.get_active_positions()
+                    if len(food_pos) > 0:
+                        bp = sim.get_body_positions(fly.name)
+                        dists = np.linalg.norm(food_pos - bp[0, :2], axis=1)
+                        to_food = food_pos[np.argmin(dists)] - bp[0, :2]
+                        move_dir = to_food * 0.01  # gentle direction bias
+                    fc.step(move_direction=move_dir, turn=turn_biases[fly.name])
+                    # Still send walking angles to keep legs in a neutral pose
+                    angles = controllers[fly.name].step(0)
+                    sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
+                else:
+                    # Walking mode
+                    angles = controllers[fly.name].step(turn_biases[fly.name])
+                    sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
 
             sim.step()
             step_count += 1
@@ -381,7 +436,9 @@ def main() -> int:
                     bp = sim.get_body_positions(fly.name)
                     v = vitals_mgr.get(fly.name)
                     biome_info = effects.get_biome_summary(fly.name)
-                    print(f"\n  {fly.name} @ ({bp[0,0]:+6.1f},{bp[0,1]:+6.1f}) [{biome_info}]")
+                    fc = flight_ctrls[fly.name]
+                    mode = "FLYING" if fc.is_flying else "WALKING"
+                    print(f"\n  {fly.name} @ ({bp[0,0]:+6.1f},{bp[0,1]:+6.1f},z={bp[0,2]:.1f}) [{biome_info}] {mode}")
                     print(v.get_status_bar())
                     print(f"  food={v.food_eaten} dist={v.distance_traveled:.1f}mm")
 
