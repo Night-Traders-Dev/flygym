@@ -47,17 +47,13 @@ MAX_FOOD = 15
 class WalkingController:
     def __init__(self, fly, sim_timestep):
         snippet = MotionSnippet()
-        # Only pass leg DOFs to MotionSnippet (it doesn't know about wings)
-        all_dofs = fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
-        leg_dofs = [d for d in all_dofs if d.child.is_leg()]
+        dof_order = fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
         self.joint_angles = snippet.get_joint_angles(
-            output_timestep=sim_timestep, output_dof_order=leg_dofs,
+            output_timestep=sim_timestep, output_dof_order=dof_order,
         )
-        self._leg_dof_indices = [i for i, d in enumerate(all_dofs) if d.child.is_leg()]
-        self._n_total_dofs = len(all_dofs)
         self.n_steps = self.joint_angles.shape[0]
-        self.n_leg_dofs = self.joint_angles.shape[1]
-        self.dpl = self.n_leg_dofs // 6
+        self.n_dofs = self.joint_angles.shape[1]
+        self.dpl = self.n_dofs // 6
         self.idx = 0
         self._skip_counter = 0
         self._speed_factor = 1.0
@@ -76,19 +72,14 @@ class WalkingController:
             self.idx += steps
             self._skip_counter -= steps
 
-        leg_angles = self.joint_angles[self.idx % self.n_steps].copy()
+        angles = self.joint_angles[self.idx % self.n_steps].copy()
         for leg_idx in range(6):
             b = leg_idx * self.dpl
             if leg_idx < 3:
-                leg_angles[b + 1] *= (1.0 + turn_bias * 0.3)
+                angles[b + 1] *= (1.0 + turn_bias * 0.3)
             else:
-                leg_angles[b + 1] *= (1.0 - turn_bias * 0.3)
-
-        # Build full actuator array (legs + wings at neutral=0)
-        full = np.zeros(self._n_total_dofs)
-        for i, idx in enumerate(self._leg_dof_indices):
-            full[idx] = leg_angles[i]
-        return full
+                angles[b + 1] *= (1.0 - turn_bias * 0.3)
+        return angles
 
 
 # ---------------------------------------------------------------------------
@@ -162,25 +153,16 @@ def make_fly(name):
     fly = Fly(name=name)
     skeleton = Skeleton(
         axis_order=AxisOrder.YAW_PITCH_ROLL,
-        joint_preset=JointPreset.ALL_BIOLOGICAL,  # includes wing joints
+        joint_preset=JointPreset.LEGS_ONLY,  # legs only — flight via xfrc_applied
     )
     fly.add_joints(skeleton, neutral_pose=KinematicPosePreset.NEUTRAL)
 
-    # Leg actuators (position control for walking)
     leg_dofs = skeleton.get_actuated_dofs_from_preset(
         ActuatedDOFPreset.LEGS_ACTIVE_ONLY
     )
     fly.add_actuators(
         leg_dofs, ActuatorType.POSITION,
         kp=150.0, neutral_input=KinematicPosePreset.NEUTRAL,
-        ctrlrange=(-3.14, 3.14),
-    )
-
-    # Wing actuators (motor control for flight — direct torque)
-    wing_dofs = [d for d in skeleton.iter_jointdofs() if "wing" in d.name]
-    fly.add_actuators(
-        wing_dofs, ActuatorType.POSITION,
-        kp=20.0,
         ctrlrange=(-3.14, 3.14),
     )
 
@@ -375,8 +357,13 @@ def main() -> int:
 
                     if should_fly and not fc.is_flying:
                         fc.start_flying()
+                        # Disable adhesion during flight
+                        sim.set_leg_adhesion_states(fly.name, np.zeros(6, dtype=bool))
                     elif (not should_fly or food_dist < 3.0) and fc.is_flying:
                         fc.stop_flying()
+                        # Re-enable adhesion for walking
+                        am = effects.get_adhesion_modifier(fly.name)
+                        sim.set_leg_adhesion_states(fly.name, np.ones(6, dtype=bool) * am)
 
             # --- Walk or fly ---
             for fly in flies:
