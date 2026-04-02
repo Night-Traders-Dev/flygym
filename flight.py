@@ -167,13 +167,14 @@ class FlightController:
         tilt = np.cross(body_up, world_up)
         self.sim.mj_data.xfrc_applied[self._thorax_id, 3:] = tilt * 0.5
 
-        # Animate wings
-        throttle = np.clip(force_z / self.weight, 0, 1.2)
+        # Animate wings (very gentle — just visual, not fighting the flight forces)
+        throttle_vis = np.clip(force_z / self.weight, 0, 1.0)
         wing_angles = self.wings.step(
-            throttle=throttle,
+            throttle=throttle_vis,
             pitch_bias=pitch_bias,
             roll_bias=roll_bias,
             yaw_bias=yaw_bias,
         )
         for key, aid in self._wing_ctrl_map.items():
-            self.sim.mj_data.ctrl[aid] = wing_angles[key] * 0.3  # scaled for visual
+            # Tiny amplitude so wings visually flutter without creating destabilizing torques
+            self.sim.mj_data.ctrl[aid] = wing_angles[key] * 0.05
