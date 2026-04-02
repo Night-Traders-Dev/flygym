@@ -108,48 +108,31 @@ class AerodynamicsModel:
         total_force = np.zeros(3)
         total_torque = np.zeros(3)
 
-        # Weight to hover: total_mass * |gravity_z| ≈ 10
-        # Each wing produces ~5 at throttle=1.0, but averaged over the stroke
-        # cycle the mean is lower. Calibrated so throttle=0.5 ≈ hover.
-        hover_force_per_wing = 5.0
+        # Cycle-averaged approach: instead of oscillating forces at 200Hz,
+        # apply steady mean lift proportional to throttle. This is physically
+        # equivalent to the time-averaged force over many wing beats.
+        # Weight ≈ 10 force units. At throttle=0.5, total lift should ≈ weight.
+        throttle = self._parent_controller._last_throttle
+
+        mean_lift_per_wing = 5.0 * throttle
 
         for side in ["l", "r"]:
-            stroke_angle = wing_commands[f"{side}_yaw"]  # current stroke position
-            wing_pitch = wing_commands[f"{side}_pitch"]  # angle of attack
             wing_roll = wing_commands[f"{side}_roll"]
+            wing_pitch = wing_commands[f"{side}_pitch"]
 
-            # Instantaneous stroke velocity from commanded sinusoidal
-            # d/dt(A*sin(wt)) = A*w*cos(wt), but we approximate from angle
-            # At peak velocity (mid-stroke), force is maximum
-            # Use |sin(stroke/amplitude)| as a proxy for force variation
-            stroke_amp = self._parent_controller.wings.stroke_amplitude
-            if stroke_amp > 0.01:
-                normalized_pos = stroke_angle / stroke_amp
-                # Force peaks at mid-stroke (where velocity is highest)
-                velocity_factor = np.sqrt(1 - np.clip(normalized_pos**2, 0, 0.99))
-            else:
-                velocity_factor = 0
+            # Steady lift (upward)
+            lift_force = body_up * mean_lift_per_wing
 
-            # Lift coefficient from angle of attack
-            alpha = abs(wing_pitch)
-            cl = 0.225 + 1.58 * np.sin(2.13 * alpha - np.radians(7.2))
-            cl = max(0, cl)
-
-            # Lift force: proportional to velocity and AoA
-            lift_mag = hover_force_per_wing * velocity_factor * cl / 1.5  # normalize by typical CL
-            lift_force = body_up * lift_mag
-
-            # Small forward thrust from drag asymmetry during upstroke/downstroke
-            thrust = body_forward * lift_mag * 0.05 * np.sign(wing_pitch)
+            # Small forward thrust when pitched forward
+            pitch_bias = self._parent_controller._last_pitch_bias
+            thrust = body_forward * mean_lift_per_wing * pitch_bias * 0.15
 
             total_force += lift_force + thrust
 
-            # Torque for turning: asymmetric wing amplitude creates yaw torque
+            # Turning torques from asymmetric roll
             side_sign = 1.0 if side == "l" else -1.0
-            yaw_torque = body_up * lift_mag * wing_roll * side_sign * 0.3
-            # Pitch torque from forward/back stroke bias
-            pitch_torque = body_left * lift_mag * 0.01 * normalized_pos
-            total_torque += yaw_torque + pitch_torque
+            yaw_torque = body_up * mean_lift_per_wing * wing_roll * side_sign * 0.2
+            total_torque += yaw_torque
 
         return total_force, total_torque
 
@@ -232,6 +215,9 @@ class FlightController:
         self.is_flying = False
         self.target_altitude = 3.0  # mm above ground
         self._flight_time = 0.0
+        self._prev_alt = 0.0
+        self._last_throttle = 0.0
+        self._last_pitch_bias = 0.0
 
         # Find wing actuator indices
         self._wing_act_indices = {}
@@ -280,12 +266,20 @@ class FlightController:
         bp = self.sim.get_body_positions(self.fly_name)
         altitude = bp[0, 2]
 
-        # Altitude PD-controller
+        # Altitude PD-controller with finite-difference velocity
         alt_error = self.target_altitude - altitude
-        # Estimate vertical velocity from body state
-        body_id = self.aero._thorax_bodyid
-        vz = self.sim.mj_data.cvel[body_id, 5]  # linear z velocity
-        throttle = np.clip(0.5 + alt_error * 0.15 - vz * 0.05, 0.2, 1.0)
+        dt = self.sim.mj_model.opt.timestep
+        vz = (altitude - self._prev_alt) / max(dt, 1e-8)
+        self._prev_alt = altitude
+
+        # Smooth takeoff ramp (prevent initial force spike)
+        ramp = min(1.0, self._flight_time / 0.5)  # ramp over 0.5s
+
+        # PD control
+        throttle = 0.50 + alt_error * 0.08 - vz * 0.004
+        throttle = np.clip(throttle * ramp, 0.0, 0.80)
+        self._last_throttle = throttle
+        self._last_pitch_bias = pitch_bias
 
         # Direction control
         pitch_bias = 0.0
