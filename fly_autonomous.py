@@ -213,7 +213,7 @@ def make_default_biome_grid():
 # ---------------------------------------------------------------------------
 def main() -> int:
     timestep = 1e-4
-    num_flies = 3
+    num_flies = 1
     realtime_factor = 1.0  # true real-time: 1 wall-second = 1 sim-second
     zone_size = 20.0  # mm per biome zone
 
@@ -240,11 +240,9 @@ def main() -> int:
         self._neutral_keyframe.ctrl = nc
     _wm.BaseWorld._rebuild_neutral_keyframe = _fix
 
-    # Spawn flies in the center (forest floor region)
+    # Spawn fly in the center (forest floor region)
     spawns = [
         ((0, 0, 0.7), Rotation3D("quat", (1, 0, 0, 0))),
-        ((3, -2, 0.7), Rotation3D("quat", (0.924, 0, 0, 0.383))),
-        ((-2, 3, 0.7), Rotation3D("quat", (0.924, 0, 0, -0.383))),
     ]
 
     flies = []
