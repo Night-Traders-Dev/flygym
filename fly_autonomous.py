@@ -193,7 +193,7 @@ def make_default_biome_grid():
 def main() -> int:
     timestep = 1e-4
     num_flies = 3
-    realtime_factor = 5.0
+    realtime_factor = 1.0  # true real-time: 1 wall-second = 1 sim-second
     zone_size = 20.0  # mm per biome zone
 
     biome_grid = make_default_biome_grid()
