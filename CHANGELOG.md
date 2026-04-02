@@ -4,6 +4,16 @@ All notable changes to our fork of [NeLy-EPFL/flygym](https://github.com/NeLy-EP
 
 ## [Unreleased]
 
+### Added — Flight System
+
+- **`flight.py`** — Quasi-steady aerodynamic flight model for Drosophila
+  - `AerodynamicsModel`: computes cycle-averaged lift and drag forces from commanded wing kinematics, applied via `xfrc_applied` on thorax body
+  - `WingBeatController`: generates 200Hz wing beat patterns (stroke sweep, pitch rotation, roll deviation) with throttle, pitch, roll, and yaw control inputs
+  - `FlightController`: high-level flight manager combining altitude PD control, directional steering, smooth takeoff ramp (0.5s), and landing
+  - Wing DOFs: 6 actuated joints (3 per wing: yaw/pitch/roll) using `JointPreset.ALL_BIOLOGICAL`
+  - Fly decides to take off when food is far (>8mm) and hunger is high; lands when close to food (<3mm)
+  - Flight drains energy faster than walking (via vitals system)
+
 ### Added — Multi-Biome World System
 
 - **`biome.py`** — Biome data model, world generator, and 3D environment objects
