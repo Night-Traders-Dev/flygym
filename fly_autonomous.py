@@ -35,6 +35,7 @@ from biome import (
     FOREST_FLOOR, MEADOW, WETLAND, SANDY_ARID, FRUIT_GARDEN,
 )
 from biome_effects import BiomeEffectsEngine
+from fly_vitals import VitalsManager
 
 MAX_FOOD = 15
 
@@ -122,19 +123,23 @@ class FoodManager:
         if mid >= 0:
             self.mj_data.mocap_pos[mid] = [0, 0, -10]
 
-    def update(self, fly_positions):
+    def update(self, fly_positions_dict):
+        """Update food. Returns set of fly names that ate food this tick."""
+        ate = set()
         for s in range(MAX_FOOD):
             if not self.active[s]:
                 continue
-            for fp in fly_positions:
+            for fly_name, fp in fly_positions_dict.items():
                 if np.linalg.norm(fp[:2] - self.positions[s]) < 1.5:
                     self._hide(s)
+                    ate.add(fly_name)
                     break
         if self.active.sum() < 5:
             self._spawn()
             self._spawn()
         elif self.active.sum() < 8 and self.rng.random() < 0.3:
             self._spawn()
+        return ate
 
     def get_active_positions(self):
         return self.positions[self.active]
@@ -249,6 +254,10 @@ def main() -> int:
     spawn_range = (world.ncols * zone_size) / 2 - zone_size / 2
     food_mgr = FoodManager(sim.mj_model, sim.mj_data, effects, spawn_range=spawn_range)
 
+    # Vitals
+    vitals_mgr = VitalsManager([fly.name for fly in flies])
+    flies_that_ate = set()  # tracks who ate this tick
+
     # Viewer
     viewer = mjviewer.launch_passive(
         sim.mj_model, sim.mj_data,
@@ -331,10 +340,25 @@ def main() -> int:
             sim.step()
             step_count += 1
 
-            # --- Food ---
+            # --- Food + Vitals ---
             if step_count % food_update_steps == 0:
-                fps = [sim.get_body_positions(f.name)[0] for f in flies]
-                food_mgr.update(fps)
+                fps_dict = {f.name: sim.get_body_positions(f.name)[0] for f in flies}
+                flies_that_ate = food_mgr.update(fps_dict)
+
+                # Update vitals for all flies
+                vitals_data = {}
+                for fly in flies:
+                    bp = sim.get_body_positions(fly.name)
+                    biome = effects.get_current_biome(fly.name)
+                    ca, _, *__ = sim.get_ground_contact_info(fly.name)
+                    vitals_data[fly.name] = {
+                        "pos": bp[0],
+                        "biome_temp": biome.temperature if biome else 22.0,
+                        "biome_humidity": biome.humidity if biome else 0.5,
+                        "ate_food": fly.name in flies_that_ate,
+                        "is_walking": ca.sum() >= 2,
+                    }
+                vitals_mgr.update_all(food_update_steps * timestep, vitals_data)
 
             # --- Viewer sync + pacing ---
             if step_count % sync_interval == 0:
@@ -349,18 +373,17 @@ def main() -> int:
             if step_count % metrics_interval == 0:
                 sim_t = step_count * timestep
                 fp = food_mgr.get_active_positions()
-                print(f"\n--- t={sim_t:.0f}s  food={len(fp)} ---")
+                n_alive = sum(1 for f in flies if vitals_mgr.get(f.name).alive)
+                print(f"\n{'='*65}")
+                print(f"  t={sim_t:.0f}s | food={len(fp)} | alive={n_alive}/{num_flies}")
+                print(f"{'='*65}")
                 for fly in flies:
                     bp = sim.get_body_positions(fly.name)
-                    ca, fo, *_ = sim.get_ground_contact_info(fly.name)
-                    fd = np.linalg.norm(fp - bp[0, :2], axis=1).min() if len(fp) else 999
+                    v = vitals_mgr.get(fly.name)
                     biome_info = effects.get_biome_summary(fly.name)
-                    print(
-                        f"  {fly.name}: ({bp[0,0]:+6.1f},{bp[0,1]:+6.1f}) "
-                        f"legs={int(ca.sum())}/6 "
-                        f"food={fd:5.1f}mm "
-                        f"[{biome_info}]"
-                    )
+                    print(f"\n  {fly.name} @ ({bp[0,0]:+6.1f},{bp[0,1]:+6.1f}) [{biome_info}]")
+                    print(v.get_status_bar())
+                    print(f"  food={v.food_eaten} dist={v.distance_traveled:.1f}mm")
 
     except KeyboardInterrupt:
         print("\nStopped.")
