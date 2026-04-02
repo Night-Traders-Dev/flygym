@@ -452,9 +452,36 @@ class BiomeWorld(FlatGroundWorld):
             body.add("geom", type="sphere", size=(0.3,),
                      rgba=(0.85, 0.15, 0.1, 0.9), contype=0, conaffinity=0)
 
+        # Border walls (prevent flies from falling off the edge)
+        arena_half_x = self.ncols * zone_size / 2
+        arena_half_y = self.nrows * zone_size / 2
+        wall_h = 3.0   # mm tall (fly is ~0.5mm, this is a cliff)
+        wall_t = 0.5    # mm thick
+        wall_rgba = (0.35, 0.30, 0.20, 0.6)  # semi-transparent earth tone
+
+        wall_specs = [
+            ("wall_north", (0, arena_half_y + wall_t, wall_h / 2),
+             (arena_half_x + wall_t, wall_t, wall_h / 2)),
+            ("wall_south", (0, -arena_half_y - wall_t, wall_h / 2),
+             (arena_half_x + wall_t, wall_t, wall_h / 2)),
+            ("wall_east", (arena_half_x + wall_t, 0, wall_h / 2),
+             (wall_t, arena_half_y + wall_t, wall_h / 2)),
+            ("wall_west", (-arena_half_x - wall_t, 0, wall_h / 2),
+             (wall_t, arena_half_y + wall_t, wall_h / 2)),
+        ]
+        self._wall_geoms = []
+        for wname, wpos, wsize in wall_specs:
+            wg = self.mjcf_root.worldbody.add(
+                "geom", type="box", name=wname,
+                pos=wpos, size=wsize,
+                rgba=wall_rgba, contype=0, conaffinity=0,
+            )
+            self._wall_geoms.append(wg)
+
     # --- Multi-fly contact overrides ---
 
     def _set_ground_contact(self, fly, bodysegs, params):
+        # Zone ground contacts
         for (row, col), geom in self._zone_geoms.items():
             biome = self.biome_grid[row][col]
             for bs in bodysegs:
@@ -463,6 +490,18 @@ class BiomeWorld(FlatGroundWorld):
                     "pair", geom1=fly_geom, geom2=geom,
                     name=f"{fly.name}_{bs.name}-z{row}_{col}",
                     friction=(*biome.friction, 0.001, 0.001),
+                    solref=params.get_solref_tuple(),
+                    solimp=params.get_solimp_tuple(),
+                    margin=params.margin,
+                )
+        # Wall contacts
+        for wg in self._wall_geoms:
+            for bs in bodysegs:
+                fly_geom = fly.mjcf_root.find("geom", bs.name)
+                self.mjcf_root.contact.add(
+                    "pair", geom1=fly_geom, geom2=wg,
+                    name=f"{fly.name}_{bs.name}-{wg.name}",
+                    friction=(1.0, 0.005, 0.0001, 0.001, 0.001),
                     solref=params.get_solref_tuple(),
                     solimp=params.get_solimp_tuple(),
                     margin=params.margin,
