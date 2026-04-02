@@ -279,7 +279,6 @@ class FlightController:
         throttle = 0.50 + alt_error * 0.08 - vz * 0.004
         throttle = np.clip(throttle * ramp, 0.0, 0.80)
         self._last_throttle = throttle
-        self._last_pitch_bias = pitch_bias
 
         # Direction control
         pitch_bias = 0.0
@@ -301,6 +300,8 @@ class FlightController:
                 cross = fwd_x * dy - fwd_y * dx
                 yaw_bias += np.clip(cross * 0.3, -0.5, 0.5)
 
+        self._last_pitch_bias = pitch_bias
+
         # Generate wing kinematics
         wing_angles = self.wings.step(
             throttle=throttle,
@@ -309,9 +310,13 @@ class FlightController:
             yaw_bias=yaw_bias,
         )
 
-        # Apply wing angles to actuators
+        # Apply wing angles to actuators (visual only — wings flap but
+        # actual flight force comes from xfrc_applied below)
         for key, aid in self._wing_ctrl_map.items():
-            self.sim.mj_data.ctrl[aid] = wing_angles[key]
+            # Scale down to prevent actuator reaction forces from destabilizing
+            self.sim.mj_data.ctrl[aid] = wing_angles[key] * 0.3
 
-        # Apply aerodynamic forces (from commanded kinematics, not measured)
+        # Clear previous aero forces, then apply new ones
+        body_id = self.aero._thorax_bodyid
+        self.sim.mj_data.xfrc_applied[body_id, :] = 0.0
         self.aero.apply_forces(wing_angles)

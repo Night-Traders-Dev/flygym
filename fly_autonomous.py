@@ -47,13 +47,17 @@ MAX_FOOD = 15
 class WalkingController:
     def __init__(self, fly, sim_timestep):
         snippet = MotionSnippet()
-        dof_order = fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
+        # Only pass leg DOFs to MotionSnippet (it doesn't know about wings)
+        all_dofs = fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
+        leg_dofs = [d for d in all_dofs if d.child.is_leg()]
         self.joint_angles = snippet.get_joint_angles(
-            output_timestep=sim_timestep, output_dof_order=dof_order,
+            output_timestep=sim_timestep, output_dof_order=leg_dofs,
         )
+        self._leg_dof_indices = [i for i, d in enumerate(all_dofs) if d.child.is_leg()]
+        self._n_total_dofs = len(all_dofs)
         self.n_steps = self.joint_angles.shape[0]
-        self.n_dofs = self.joint_angles.shape[1]
-        self.dpl = self.n_dofs // 6
+        self.n_leg_dofs = self.joint_angles.shape[1]
+        self.dpl = self.n_leg_dofs // 6
         self.idx = 0
         self._skip_counter = 0
         self._speed_factor = 1.0
@@ -72,14 +76,19 @@ class WalkingController:
             self.idx += steps
             self._skip_counter -= steps
 
-        angles = self.joint_angles[self.idx % self.n_steps].copy()
+        leg_angles = self.joint_angles[self.idx % self.n_steps].copy()
         for leg_idx in range(6):
             b = leg_idx * self.dpl
             if leg_idx < 3:
-                angles[b + 1] *= (1.0 + turn_bias * 0.3)
+                leg_angles[b + 1] *= (1.0 + turn_bias * 0.3)
             else:
-                angles[b + 1] *= (1.0 - turn_bias * 0.3)
-        return angles
+                leg_angles[b + 1] *= (1.0 - turn_bias * 0.3)
+
+        # Build full actuator array (legs + wings at neutral=0)
+        full = np.zeros(self._n_total_dofs)
+        for i, idx in enumerate(self._leg_dof_indices):
+            full[idx] = leg_angles[i]
+        return full
 
 
 # ---------------------------------------------------------------------------
