@@ -82,90 +82,80 @@ class AerodynamicsModel:
         self.lift_scale = 800.0   # empirical scaling to match weight
         self.drag_scale = 400.0
 
-    def compute_forces(self):
-        """Compute aerodynamic forces from current wing state.
+    def compute_forces(self, wing_commands=None):
+        """Compute aerodynamic forces from wing beat commands.
+
+        Instead of measuring actual joint velocities (which lag behind due to
+        actuator bandwidth limits), we compute forces from the COMMANDED wing
+        kinematics. This is the standard approach for insect flight simulation
+        where wing inertia is negligible compared to aero forces.
+
+        Args:
+            wing_commands: dict from WingBeatController.step() with commanded
+                           wing angles. If None, returns zero forces.
 
         Returns (force_xyz, torque_xyz) in world frame to apply to thorax.
         """
+        if wing_commands is None:
+            return np.zeros(3), np.zeros(3)
+
         data = self.sim.mj_data
-        model = self.sim.mj_model
+        thorax_xmat = data.xmat[self._thorax_bodyid].reshape(3, 3)
+        body_up = thorax_xmat[:, 2]
+        body_forward = thorax_xmat[:, 0]
+        body_left = thorax_xmat[:, 1]
 
         total_force = np.zeros(3)
         total_torque = np.zeros(3)
 
-        # Get thorax orientation (rotation matrix)
-        thorax_xmat = data.xmat[self._thorax_bodyid].reshape(3, 3)
-        # Local axes: x=forward, y=left, z=up (in body frame)
-        body_up = thorax_xmat[:, 2]      # body z-axis in world
-        body_forward = thorax_xmat[:, 0]  # body x-axis in world
+        # Weight to hover: total_mass * |gravity_z| ≈ 10
+        # Each wing produces ~5 at throttle=1.0, but averaged over the stroke
+        # cycle the mean is lower. Calibrated so throttle=0.5 ≈ hover.
+        hover_force_per_wing = 5.0
 
         for side in ["l", "r"]:
-            dofs = self._wing_dofadrs[side]
-            if "pitch" not in dofs:
-                continue
+            stroke_angle = wing_commands[f"{side}_yaw"]  # current stroke position
+            wing_pitch = wing_commands[f"{side}_pitch"]  # angle of attack
+            wing_roll = wing_commands[f"{side}_roll"]
 
-            # Wing angular velocities
-            omega_yaw = data.qvel[dofs["yaw"]] if "yaw" in dofs else 0
-            omega_pitch = data.qvel[dofs["pitch"]] if "pitch" in dofs else 0
-            omega_roll = data.qvel[dofs["roll"]] if "roll" in dofs else 0
+            # Instantaneous stroke velocity from commanded sinusoidal
+            # d/dt(A*sin(wt)) = A*w*cos(wt), but we approximate from angle
+            # At peak velocity (mid-stroke), force is maximum
+            # Use |sin(stroke/amplitude)| as a proxy for force variation
+            stroke_amp = self._parent_controller.wings.stroke_amplitude
+            if stroke_amp > 0.01:
+                normalized_pos = stroke_angle / stroke_amp
+                # Force peaks at mid-stroke (where velocity is highest)
+                velocity_factor = np.sqrt(1 - np.clip(normalized_pos**2, 0, 0.99))
+            else:
+                velocity_factor = 0
 
-            # Wing angles
-            qpos_pitch_adr = model.jnt_qposadr[
-                mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT,
-                              self._wing_joint_names[side]["pitch"])
-            ]
-            wing_pitch = data.qpos[qpos_pitch_adr]
-
-            # Stroke velocity (mainly yaw for Drosophila — the sweeping motion)
-            stroke_vel = abs(omega_yaw)
-
-            # Wing tip velocity (mm/s)
-            v_tip = stroke_vel * self.wing_length
-
-            # Angle of attack (simplified: wing pitch angle)
+            # Lift coefficient from angle of attack
             alpha = abs(wing_pitch)
-            alpha = np.clip(alpha, 0, np.pi / 2)
-
-            # Quasi-steady force coefficients
             cl = 0.225 + 1.58 * np.sin(2.13 * alpha - np.radians(7.2))
-            cd = 1.92 - 1.55 * np.cos(2.04 * alpha - np.radians(9.82))
             cl = max(0, cl)
-            cd = max(0.1, cd)
 
-            # Dynamic pressure * area
-            q_S = 0.5 * self.air_density * v_tip**2 * self.wing_area
-
-            # Lift: perpendicular to stroke plane (roughly body up)
-            lift_mag = q_S * cl * self.lift_scale
+            # Lift force: proportional to velocity and AoA
+            lift_mag = hover_force_per_wing * velocity_factor * cl / 1.5  # normalize by typical CL
             lift_force = body_up * lift_mag
 
-            # Drag: opposing stroke direction (roughly forward/backward)
-            drag_sign = -np.sign(omega_yaw)
-            drag_mag = q_S * cd * self.drag_scale
-            # Drag is in the stroke plane, decompose into forward component
-            if side == "l":
-                stroke_dir = np.cross(body_up, body_forward) * drag_sign
-            else:
-                stroke_dir = -np.cross(body_up, body_forward) * drag_sign
-            stroke_dir_norm = np.linalg.norm(stroke_dir)
-            if stroke_dir_norm > 1e-8:
-                stroke_dir /= stroke_dir_norm
-            drag_force = stroke_dir * drag_mag
+            # Small forward thrust from drag asymmetry during upstroke/downstroke
+            thrust = body_forward * lift_mag * 0.05 * np.sign(wing_pitch)
 
-            total_force += lift_force + drag_force
+            total_force += lift_force + thrust
 
-            # Torque from asymmetric forces (for turning)
-            if side == "l":
-                moment_arm = np.cross(body_up, body_forward) * self.wing_length * 0.5
-            else:
-                moment_arm = -np.cross(body_up, body_forward) * self.wing_length * 0.5
-            total_torque += np.cross(moment_arm, lift_force) * 0.1
+            # Torque for turning: asymmetric wing amplitude creates yaw torque
+            side_sign = 1.0 if side == "l" else -1.0
+            yaw_torque = body_up * lift_mag * wing_roll * side_sign * 0.3
+            # Pitch torque from forward/back stroke bias
+            pitch_torque = body_left * lift_mag * 0.01 * normalized_pos
+            total_torque += yaw_torque + pitch_torque
 
         return total_force, total_torque
 
-    def apply_forces(self):
+    def apply_forces(self, wing_commands=None):
         """Compute and apply aerodynamic forces to thorax."""
-        force, torque = self.compute_forces()
+        force, torque = self.compute_forces(wing_commands)
         self.sim.mj_data.xfrc_applied[self._thorax_bodyid, :3] += force
         self.sim.mj_data.xfrc_applied[self._thorax_bodyid, 3:] += torque
 
@@ -237,6 +227,7 @@ class FlightController:
         self.fly_name = fly_name
         self.fly = fly
         self.aero = AerodynamicsModel(sim, fly_name, fly)
+        self.aero._parent_controller = self  # back-reference for wing params
         self.wings = WingBeatController(timestep)
         self.is_flying = False
         self.target_altitude = 3.0  # mm above ground
@@ -289,9 +280,12 @@ class FlightController:
         bp = self.sim.get_body_positions(self.fly_name)
         altitude = bp[0, 2]
 
-        # Altitude controller (simple P-controller)
+        # Altitude PD-controller
         alt_error = self.target_altitude - altitude
-        throttle = np.clip(0.7 + alt_error * 0.3, 0.3, 1.2)
+        # Estimate vertical velocity from body state
+        body_id = self.aero._thorax_bodyid
+        vz = self.sim.mj_data.cvel[body_id, 5]  # linear z velocity
+        throttle = np.clip(0.5 + alt_error * 0.15 - vz * 0.05, 0.2, 1.0)
 
         # Direction control
         pitch_bias = 0.0
@@ -325,5 +319,5 @@ class FlightController:
         for key, aid in self._wing_ctrl_map.items():
             self.sim.mj_data.ctrl[aid] = wing_angles[key]
 
-        # Apply aerodynamic forces
-        self.aero.apply_forces()
+        # Apply aerodynamic forces (from commanded kinematics, not measured)
+        self.aero.apply_forces(wing_angles)
