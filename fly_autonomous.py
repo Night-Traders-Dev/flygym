@@ -356,7 +356,10 @@ def make_fly(name):
 def main() -> int:
     timestep = 1e-4
     num_flies = 3
-    realtime_factor = 1.0  # 1:1 real-time
+    # Physics runs at 10x real-time so fly movement is visible
+    # (flies are ~2mm long and walk ~1.5mm/s — invisible at 1:1)
+    # 1 wall-second = 10 simulated seconds
+    realtime_factor = 10.0
 
     # Quaternions for rotation around Z axis only (w, x, y, z):
     # (1,0,0,0) = forward, (cos(a/2),0,0,sin(a/2)) = yaw by angle a
@@ -452,10 +455,10 @@ def main() -> int:
             break
 
     viewer.cam.type = mj.mjtCamera.mjCAMERA_FREE
-    viewer.cam.distance = 30.0
-    viewer.cam.elevation = -35.0
+    viewer.cam.distance = 15.0
+    viewer.cam.elevation = -30.0
     viewer.cam.azimuth = 135.0
-    viewer.cam.lookat[:] = [5, 0, 0]
+    viewer.cam.lookat[:] = [0, 0, 0]
 
     print("=" * 65)
     print("  NeuroMechFly v2 — Forest Floor Simulation")
