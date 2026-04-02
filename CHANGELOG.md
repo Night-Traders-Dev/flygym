@@ -6,16 +6,22 @@ All notable changes to our fork of [NeLy-EPFL/flygym](https://github.com/NeLy-EP
 
 ### Added — Multi-Biome World System
 
-- **`biome.py`** — Biome data model and world generator
+- **`biome.py`** — Biome data model, world generator, and 3D environment objects
   - `BiomeParams` dataclass: name, ground colors, reflectance, wind vector, temperature, humidity, friction, food density, elevation parameters
   - 5 preset biomes tuned for Drosophila ecology:
     - `FOREST_FLOOR`: dark soil, leaves/twigs, 20C, 75% humidity, no wind, normal friction
-    - `MEADOW`: green grass, seed specks, 26C, 40% humidity, light breeze, lower friction
-    - `WETLAND`: dark mud, water glints, 18C, 95% humidity, still air, very low friction, high reflectance
-    - `SANDY_ARID`: tan sand, pebbles, 34C, 12% humidity, strong wind, high friction, low food
-    - `FRUIT_GARDEN`: rich soil, colorful fallen fruit spots, 24C, 55% humidity, high food density
-  - `generate_biome_texture()`: per-biome procedural texture generator (256x256 RGB)
-  - `BiomeWorld(FlatGroundWorld)`: 2D grid of biome zones, each with own ground geom, texture, material, and friction
+    - `MEADOW`: green grass, seed heads, 26C, 40% humidity, light breeze, lower friction
+    - `WETLAND`: dark mud, puddles/reeds, 18C, 95% humidity, still air, very low friction, high reflectance
+    - `SANDY_ARID`: tan sand, pebbles/rocks, 34C, 12% humidity, strong wind, high friction, low food
+    - `FRUIT_GARDEN`: rich soil, colorful fallen fruit, 24C, 55% humidity, high food density
+  - `generate_biome_texture()`: 1024x1024 procedural textures using multi-octave value noise (no sine banding), with per-biome detail features (soil patches, water pools, wind ripples)
+  - `_add_scatter_objects()`: generates real 3D MuJoCo geometry per biome zone (~935 objects across 25 zones):
+    - Forest: ellipsoid leaves (5 color variants), capsule twigs, sphere pebbles
+    - Meadow: thin capsule grass blades (30-60 per zone), sphere seed heads
+    - Wetland: cylinder puddle discs with reflective rims, tall capsule reeds
+    - Sandy: ellipsoid rocks, capsule dried sticks
+    - Fruit garden: colorful sphere fruits (red/yellow/orange/green/plum), ellipsoid green leaves
+  - `BiomeWorld(FlatGroundWorld)`: 2D grid of biome zones with 3D objects, per-zone textures/materials/friction, neutral dirt fill between zones
   - `get_biome_at(x, y)`: position-to-biome lookup for runtime effects
 
 - **`biome_effects.py`** — Runtime environmental effects engine
@@ -26,13 +32,24 @@ All notable changes to our fork of [NeLy-EPFL/flygym](https://github.com/NeLy-EP
   - Food density: biases food spawn probability toward richer biomes (fruit garden gets 2.5x food)
   - `get_biome_summary()`: one-line status string for terminal metrics
 
-- **`fly_autonomous.py`** updated to use biome system
+- **`fly_vitals.py`** — Fly biological needs simulation
+  - `FlyVitals` class: tracks hunger (0-100), thirst (0-100), energy (0-100), health (0-100)
+  - Hunger: drains at base rate, faster in heat and while walking, restored by eating food (+25)
+  - Thirst: drains faster in hot/dry biomes, slower in humid biomes, slowly rehydrates in wetlands
+  - Energy: drains while walking, drains faster in extreme temperatures, recovers while resting
+  - Health: degrades when hunger/thirst/energy critically low, degrades in extreme heat/cold, slowly recovers when well-fed/hydrated
+  - Death tracking: cause of death (starvation, dehydration, exhaustion, exposure)
+  - `get_status_bar()`: visual bar chart display for terminal (HNG/THR/NRG/HP with block chars)
+  - `get_oneliner()`: compact single-line summary
+  - `VitalsManager`: manages vitals for all flies, bulk update per tick
+
+- **`fly_autonomous.py`** updated to use biome + vitals systems
   - 5x5 biome grid (100x100mm world) with natural biome arrangement (sand→meadow→forest→garden→wetland diagonal)
   - Walking speed adapts to temperature (slower in hot/cold biomes)
   - Adhesion adapts to humidity (slippery in wetland)
   - Wind pushes flies in sandy/arid zones
   - Food spawns weighted by biome (most food in fruit garden, least in desert)
-  - Terminal metrics now show current biome, temperature, humidity, wind per fly
+  - Terminal metrics now show per-fly: position, biome, hunger/thirst/energy/health bars, food eaten, distance traveled
 
 ### Upstream
 

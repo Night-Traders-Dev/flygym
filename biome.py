@@ -374,6 +374,16 @@ class BiomeWorld(FlatGroundWorld):
 
         self.ground_geom.contype = 0
         self.ground_geom.conaffinity = 0
+        # Restyle parent's infinite plane to neutral earth (hides gaps between zones)
+        dirt_tex = self.mjcf_root.asset.add(
+            "texture", name="tex_dirt_fill", type="2d", builtin="flat",
+            width=64, height=64, rgb1=(0.32, 0.28, 0.20), rgb2=(0.28, 0.24, 0.17),
+        )
+        dirt_mat = self.mjcf_root.asset.add(
+            "material", name="mat_dirt_fill", texture=dirt_tex,
+            texrepeat=(100, 100), reflectance=0.02,
+        )
+        self.ground_geom.material = dirt_mat
 
         self._zone_geoms = {}
         self._biome_textures = {}
