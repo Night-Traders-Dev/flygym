@@ -4,6 +4,36 @@ All notable changes to our fork of [NeLy-EPFL/flygym](https://github.com/NeLy-EP
 
 ## [Unreleased]
 
+### Added — Multi-Biome World System
+
+- **`biome.py`** — Biome data model and world generator
+  - `BiomeParams` dataclass: name, ground colors, reflectance, wind vector, temperature, humidity, friction, food density, elevation parameters
+  - 5 preset biomes tuned for Drosophila ecology:
+    - `FOREST_FLOOR`: dark soil, leaves/twigs, 20C, 75% humidity, no wind, normal friction
+    - `MEADOW`: green grass, seed specks, 26C, 40% humidity, light breeze, lower friction
+    - `WETLAND`: dark mud, water glints, 18C, 95% humidity, still air, very low friction, high reflectance
+    - `SANDY_ARID`: tan sand, pebbles, 34C, 12% humidity, strong wind, high friction, low food
+    - `FRUIT_GARDEN`: rich soil, colorful fallen fruit spots, 24C, 55% humidity, high food density
+  - `generate_biome_texture()`: per-biome procedural texture generator (256x256 RGB)
+  - `BiomeWorld(FlatGroundWorld)`: 2D grid of biome zones, each with own ground geom, texture, material, and friction
+  - `get_biome_at(x, y)`: position-to-biome lookup for runtime effects
+
+- **`biome_effects.py`** — Runtime environmental effects engine
+  - `BiomeEffectsEngine`: applies position-dependent effects each timestep
+  - Wind: per-biome force vectors applied via `mj_data.xfrc_applied` on fly root bodies
+  - Temperature: modulates walking speed factor (Gaussian curve centered at 25C optimal)
+  - Humidity: modulates tarsal adhesion gain (wet surfaces reduce grip)
+  - Food density: biases food spawn probability toward richer biomes (fruit garden gets 2.5x food)
+  - `get_biome_summary()`: one-line status string for terminal metrics
+
+- **`fly_autonomous.py`** updated to use biome system
+  - 5x5 biome grid (100x100mm world) with natural biome arrangement (sand→meadow→forest→garden→wetland diagonal)
+  - Walking speed adapts to temperature (slower in hot/cold biomes)
+  - Adhesion adapts to humidity (slippery in wetland)
+  - Wind pushes flies in sandy/arid zones
+  - Food spawns weighted by biome (most food in fruit garden, least in desert)
+  - Terminal metrics now show current biome, temperature, humidity, wind per fly
+
 ### Upstream
 
 - Rebased onto upstream `main` — flygym updated from **v1.2.1 to v2.0.0**
