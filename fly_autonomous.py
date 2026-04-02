@@ -2,8 +2,8 @@
 """
 fly_autonomous.py - Watch multiple NeuroMechFly v2 flies on a forest floor
 
-Multiple flies walk autonomously using CPG-driven leg control with food-seeking
-behavior. Food spawns at random locations periodically. Metrics are printed live.
+Uses real recorded walking kinematics (from Spotlight motion capture) looped
+continuously, with turning modulation toward food. Food spawns randomly.
 
 Launch:
     .venv/bin/python fly_autonomous.py
@@ -15,118 +15,84 @@ import time
 
 os.environ["MUJOCO_GL"] = "glfw"
 os.environ.pop("WAYLAND_DISPLAY", None)
-# Use cairo libdecor plugin (not broken GTK one) for proper title bar on Wayland
 os.environ["LIBDECOR_PLUGIN_DIR"] = "/tmp/libdecor_cairo_only"
 
 import numpy as np
 import mujoco as mj
 import mujoco.viewer as mjviewer
-import dm_control.mjcf as mjcf
+from collections import defaultdict
 
 from flygym.anatomy import (
-    Skeleton, JointPreset, AxisOrder, ActuatedDOFPreset, ContactBodiesPreset,
+    Skeleton, JointPreset, AxisOrder, ActuatedDOFPreset, LEG_LINKS,
 )
 from flygym.compose import Fly, ActuatorType, FlatGroundWorld, KinematicPosePreset
-from flygym.compose.physics import ContactParams
 from flygym.utils.math import Rotation3D
 from flygym import Simulation
+from flygym_demo.spotlight_data import MotionSnippet
 
-MAX_FOOD = 12  # pre-allocated food slot count
+MAX_FOOD = 12
 
 
 # ---------------------------------------------------------------------------
-# Forest-floor world with relocatable food
+# Multi-fly safe world with food
 # ---------------------------------------------------------------------------
 class ForestFloorWorld(FlatGroundWorld):
-    """FlatGroundWorld with forest visuals and a pool of movable food markers."""
-
-    def __init__(self, food_radius=0.4, name="forest_floor", half_size=1000):
-        super().__init__(name=name, half_size=half_size)
-        self.food_radius = food_radius
-
-        # Forest floor texture
-        forest_tex = self.mjcf_root.asset.add(
+    def __init__(self, n_food=MAX_FOOD, **kw):
+        super().__init__(**kw)
+        # Forest texture
+        ftex = self.mjcf_root.asset.add(
             "texture", name="forest_floor_tex", type="2d", builtin="flat",
-            width=512, height=512, rgb1=(0.28, 0.22, 0.14), rgb2=(0.18, 0.14, 0.08),
-        )
-        forest_mat = self.mjcf_root.asset.add(
-            "material", name="forest_floor_mat", texture=forest_tex,
-            texrepeat=(8, 8), reflectance=0.02, specular=0.05,
-        )
-        self.ground_geom.material = forest_mat
+            width=512, height=512, rgb1=(0.28, 0.22, 0.14), rgb2=(0.18, 0.14, 0.08))
+        fmat = self.mjcf_root.asset.add(
+            "material", name="forest_floor_mat", texture=ftex,
+            texrepeat=(8, 8), reflectance=0.02, specular=0.05)
+        self.ground_geom.material = fmat
         self._forest_tex_name = "forest_floor_tex"
 
         # Skybox
         self.mjcf_root.asset.add(
             "texture", name="forest_sky", type="skybox", builtin="gradient",
-            rgb1=(0.55, 0.65, 0.45), rgb2=(0.25, 0.35, 0.2), width=512, height=512,
-        )
+            rgb1=(0.55, 0.65, 0.45), rgb2=(0.25, 0.35, 0.2), width=512, height=512)
 
-        # Warm lighting
+        # Lights
         self.mjcf_root.worldbody.add(
             "light", name="sun", mode="fixed", directional=True, castshadow=True,
             pos=(0, 0, 100), dir=(0.3, 0.2, -1),
             ambient=(0.2, 0.18, 0.12), diffuse=(0.75, 0.65, 0.45),
-            specular=(0.25, 0.22, 0.15),
-        )
-        self.mjcf_root.worldbody.add(
-            "light", name="canopy_fill", mode="fixed", directional=True,
-            castshadow=False, pos=(0, 0, 80), dir=(-0.2, -0.3, -1),
-            ambient=(0.05, 0.08, 0.04), diffuse=(0.12, 0.2, 0.08),
-            specular=(0.03, 0.05, 0.02),
-        )
+            specular=(0.25, 0.22, 0.15))
 
-        # Pre-allocate food slots as mocap bodies (hidden far away initially)
-        self._food_body_names = []
-        for i in range(MAX_FOOD):
+        # Food slots (mocap bodies, hidden initially)
+        for i in range(n_food):
             body = self.mjcf_root.worldbody.add(
-                "body", name=f"food_{i}", pos=(0, 0, -10), mocap=True,
-            )
-            body.add(
-                "geom", type="sphere", size=(food_radius,),
-                rgba=(0.85, 0.15, 0.1, 0.9), contype=0, conaffinity=0,
-            )
-            body.add(
-                "geom", type="cylinder", size=(food_radius * 2.5, 0.01),
-                pos=(0, 0, -food_radius + 0.01),
-                rgba=(0.9, 0.3, 0.1, 0.25), contype=0, conaffinity=0,
-            )
-            self._food_body_names.append(f"food_{i}")
+                "body", name=f"food_{i}", pos=(0, 0, -10), mocap=True)
+            body.add("geom", type="sphere", size=(0.3,),
+                     rgba=(0.85, 0.15, 0.1, 0.9), contype=0, conaffinity=0)
 
-    def _set_ground_contact(self, fly, bodysegs_with_ground_contact, ground_contact_params):
-        for body_segment in bodysegs_with_ground_contact:
-            body_geom = fly.mjcf_root.find("geom", f"{body_segment.name}")
+    def _set_ground_contact(self, fly, bodysegs, params):
+        for b in bodysegs:
+            g = fly.mjcf_root.find("geom", b.name)
             self.mjcf_root.contact.add(
-                "pair", geom1=body_geom, geom2=self.ground_geom,
-                name=f"{fly.name}_{body_segment.name}-ground",
-                friction=ground_contact_params.get_friction_tuple(),
-                solref=ground_contact_params.get_solref_tuple(),
-                solimp=ground_contact_params.get_solimp_tuple(),
-                margin=ground_contact_params.margin,
-            )
+                "pair", geom1=g, geom2=self.ground_geom,
+                name=f"{fly.name}_{b.name}-ground",
+                friction=params.get_friction_tuple(),
+                solref=params.get_solref_tuple(),
+                solimp=params.get_solimp_tuple(), margin=params.margin)
 
-    def _add_ground_contact_sensors(self, fly, bodysegs_with_ground_contact):
-        from collections import defaultdict
-        from flygym.anatomy import LEG_LINKS
-
+    def _add_ground_contact_sensors(self, fly, bodysegs):
         if self.legpos_to_groundcontactsensors_by_fly is None:
             self.legpos_to_groundcontactsensors_by_fly = defaultdict(dict)
-
-        contact_geoms_by_leg = defaultdict(list)
-        for bodyseg in bodysegs_with_ground_contact:
-            if bodyseg.is_leg():
-                contact_geoms_by_leg[bodyseg.pos].append(bodyseg)
-        for leg, contact_geoms in contact_geoms_by_leg.items():
-            sorted_segs = sorted(contact_geoms, key=lambda s: LEG_LINKS.index(s.link))
-            subtree_rootseg = sorted_segs[0]
-            subtree_rootseg_body = fly.bodyseg_to_mjcfbody[subtree_rootseg]
-            sensor = self.mjcf_root.sensor.add(
-                "contact", subtree1=subtree_rootseg_body, geom2=self.ground_geom,
+        bl = defaultdict(list)
+        for b in bodysegs:
+            if b.is_leg(): bl[b.pos].append(b)
+        for leg, segs in bl.items():
+            segs.sort(key=lambda s: LEG_LINKS.index(s.link))
+            body = fly.bodyseg_to_mjcfbody[segs[0]]
+            s = self.mjcf_root.sensor.add(
+                "contact", subtree1=body, geom2=self.ground_geom,
                 num=1, reduce="netforce",
                 data="found force torque pos normal tangent",
-                name=f"{fly.name}_ground_contact_{leg}_leg",
-            )
-            self.legpos_to_groundcontactsensors_by_fly[fly.name][leg] = sensor
+                name=f"{fly.name}_ground_contact_{leg}_leg")
+            self.legpos_to_groundcontactsensors_by_fly[fly.name][leg] = s
 
     def upload_texture(self, mj_model):
         tex_img = _generate_forest_floor_texture(512, 512)
@@ -135,8 +101,7 @@ class ForestFloorWorld(FlatGroundWorld):
             if name == self._forest_tex_name:
                 h, w = mj_model.tex_height[i], mj_model.tex_width[i]
                 adr = mj_model.tex_adr[i]
-                flat = tex_img[:h, :w, :].flatten()
-                mj_model.tex_data[adr : adr + len(flat)] = flat
+                mj_model.tex_data[adr:adr + h*w*3] = tex_img[:h, :w, :].flatten()
                 break
 
     def apply_atmosphere(self, mj_model):
@@ -145,185 +110,110 @@ class ForestFloorWorld(FlatGroundWorld):
         mj_model.vis.map.fogend = 80.0
 
 
+def _generate_forest_floor_texture(w=512, h=512):
+    rng = np.random.RandomState(42)
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    xs, ys = np.meshgrid(np.arange(w)/w, np.arange(h)/h)
+    n = np.sin(xs*13.7+ys*9.3)*0.3 + np.sin(xs*27.1+ys*19.7)*0.15
+    bn = rng.normal(0, 6, (h, w))
+    img[:,:,0] = np.clip(62+n*40+bn, 30, 100).astype(np.uint8)
+    img[:,:,1] = np.clip(45+n*30+bn*0.8, 20, 75).astype(np.uint8)
+    img[:,:,2] = np.clip(28+n*15+bn*0.5, 10, 50).astype(np.uint8)
+    for _ in range(150):
+        cx, cy, r = rng.randint(0,w), rng.randint(0,h), rng.randint(3,12)
+        yy, xx = np.ogrid[-cy:h-cy, -cx:w-cx]
+        mask = xx**2+yy**2 <= r**2
+        img[mask] = (img[mask]*rng.uniform(0.5,0.8)).astype(np.uint8)
+    colors = [(85,60,20),(100,80,25),(55,65,30),(70,30,20)]
+    for _ in range(100):
+        cx,cy,rx,ry = rng.randint(0,w), rng.randint(0,h), rng.randint(2,8), rng.randint(4,14)
+        a = rng.uniform(0,np.pi); c = np.array(colors[rng.randint(len(colors))])
+        yy,xx = np.ogrid[-cy:h-cy, -cx:w-cx]
+        ca,sa = np.cos(a),np.sin(a)
+        mask = ((ca*xx+sa*yy)/max(rx,1))**2 + ((-sa*xx+ca*yy)/max(ry,1))**2 <= 1
+        bl = rng.uniform(0.4,0.8)
+        img[mask] = (img[mask]*(1-bl)+c*bl).astype(np.uint8)
+    return img
+
+
 # ---------------------------------------------------------------------------
-# Food manager — spawns/despawns food by moving mocap bodies
+# Food manager
 # ---------------------------------------------------------------------------
 class FoodManager:
-    def __init__(self, mj_model, mj_data, max_food, food_radius,
-                 spawn_range=30.0, spawn_interval_s=3.0, despawn_dist=2.0):
-        self.mj_model = mj_model
-        self.mj_data = mj_data
-        self.max_food = max_food
-        self.food_radius = food_radius
-        self.spawn_range = spawn_range
-        self.spawn_interval_s = spawn_interval_s
-        self.despawn_dist = despawn_dist
+    def __init__(self, mj_model, mj_data, spawn_range=10.0):
+        self.mj_model, self.mj_data = mj_model, mj_data
         self.rng = np.random.RandomState(99)
-
-        # Find mocap body IDs
-        self.food_body_ids = []
-        for i in range(max_food):
+        self.spawn_range = spawn_range
+        self.food_ids = []
+        for i in range(MAX_FOOD):
             bid = mj.mj_name2id(mj_model, mj.mjtObj.mjOBJ_BODY, f"food_{i}")
-            self.food_body_ids.append(bid)
+            self.food_ids.append(bid)
+        self.active = np.zeros(MAX_FOOD, dtype=bool)
+        self.positions = np.zeros((MAX_FOOD, 2))
+        for _ in range(5): self._spawn()
 
-        # Track which slots are active and their positions
-        self.active = np.zeros(max_food, dtype=bool)
-        self.positions = np.zeros((max_food, 2))  # xy
+    def _spawn(self):
+        slots = np.where(~self.active)[0]
+        if len(slots) == 0: return
+        s = slots[self.rng.randint(len(slots))]
+        x, y = self.rng.uniform(-self.spawn_range, self.spawn_range, 2)
+        self.positions[s] = [x, y]
+        self.active[s] = True
+        mid = self.mj_model.body_mocapid[self.food_ids[s]]
+        if mid >= 0: self.mj_data.mocap_pos[mid] = [x, y, 0.3]
 
-        # Start with a few food items
-        for _ in range(4):
-            self._spawn_one()
+    def _hide(self, s):
+        self.active[s] = False
+        mid = self.mj_model.body_mocapid[self.food_ids[s]]
+        if mid >= 0: self.mj_data.mocap_pos[mid] = [0, 0, -10]
 
-    def _spawn_one(self):
-        """Spawn food at a random location in an inactive slot."""
-        inactive = np.where(~self.active)[0]
-        if len(inactive) == 0:
-            return
-        slot = inactive[self.rng.randint(len(inactive))]
-        x = self.rng.uniform(-self.spawn_range, self.spawn_range)
-        y = self.rng.uniform(-self.spawn_range, self.spawn_range)
-        self.positions[slot] = [x, y]
-        self.active[slot] = True
-        # Move the mocap body to the new position
-        mocap_idx = self.mj_model.body_mocapid[self.food_body_ids[slot]]
-        if mocap_idx >= 0:
-            self.mj_data.mocap_pos[mocap_idx] = [x, y, self.food_radius]
-
-    def _hide(self, slot):
-        """Move food far away (despawn)."""
-        self.active[slot] = False
-        mocap_idx = self.mj_model.body_mocapid[self.food_body_ids[slot]]
-        if mocap_idx >= 0:
-            self.mj_data.mocap_pos[mocap_idx] = [0, 0, -10]
-
-    def update(self, sim_time, fly_positions):
-        """Called periodically: despawn eaten food, spawn new food."""
-        # Check if any fly is close enough to eat food
-        for slot in range(self.max_food):
-            if not self.active[slot]:
-                continue
-            for fpos in fly_positions:
-                dist = np.linalg.norm(fpos[:2] - self.positions[slot])
-                if dist < self.despawn_dist:
-                    self._hide(slot)
-                    break
-
-        # Spawn new food periodically (keep ~4-6 active)
-        n_active = self.active.sum()
-        if n_active < 4:
-            self._spawn_one()
-            self._spawn_one()
-        elif n_active < 6 and self.rng.random() < 0.3:
-            self._spawn_one()
+    def update(self, fly_positions):
+        for s in range(MAX_FOOD):
+            if not self.active[s]: continue
+            for fp in fly_positions:
+                if np.linalg.norm(fp[:2] - self.positions[s]) < 1.5:
+                    self._hide(s); break
+        if self.active.sum() < 4:
+            self._spawn(); self._spawn()
+        elif self.active.sum() < 6 and self.rng.random() < 0.3:
+            self._spawn()
 
     def get_active_positions(self):
         return self.positions[self.active]
 
 
-def _generate_forest_floor_texture(width=512, height=512):
-    rng = np.random.RandomState(42)
-    img = np.zeros((height, width, 3), dtype=np.uint8)
-    xs = np.arange(width) / width
-    ys = np.arange(height) / height
-    xx, yy = np.meshgrid(xs, ys)
-    noise = (
-        np.sin(xx * 13.7 + yy * 9.3) * 0.3
-        + np.sin(xx * 27.1 + yy * 19.7) * 0.15
-        + np.sin(xx * 53.3 + yy * 41.1) * 0.08
-    )
-    base_noise = rng.normal(0, 6, (height, width))
-    img[:, :, 0] = np.clip(62 + noise * 40 + base_noise, 30, 100).astype(np.uint8)
-    img[:, :, 1] = np.clip(45 + noise * 30 + base_noise * 0.8, 20, 75).astype(np.uint8)
-    img[:, :, 2] = np.clip(28 + noise * 15 + base_noise * 0.5, 10, 50).astype(np.uint8)
-
-    for _ in range(200):
-        cx, cy = rng.randint(0, width), rng.randint(0, height)
-        r = rng.randint(3, 12)
-        yy2, xx2 = np.ogrid[-cy : height - cy, -cx : width - cx]
-        mask = xx2**2 + yy2**2 <= r**2
-        img[mask] = (img[mask] * rng.uniform(0.5, 0.8)).astype(np.uint8)
-
-    leaf_colors = [(85, 60, 20), (100, 80, 25), (55, 65, 30), (70, 30, 20), (40, 50, 25)]
-    for _ in range(120):
-        cx, cy = rng.randint(0, width), rng.randint(0, height)
-        rx, ry = rng.randint(2, 8), rng.randint(4, 14)
-        angle = rng.uniform(0, np.pi)
-        color = np.array(leaf_colors[rng.randint(len(leaf_colors))])
-        yy2, xx2 = np.ogrid[-cy : height - cy, -cx : width - cx]
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        xr = cos_a * xx2 + sin_a * yy2
-        yr = -sin_a * xx2 + cos_a * yy2
-        mask = (xr / max(rx, 1)) ** 2 + (yr / max(ry, 1)) ** 2 <= 1
-        blend = rng.uniform(0.4, 0.8)
-        img[mask] = (img[mask] * (1 - blend) + color * blend).astype(np.uint8)
-
-    for _ in range(400):
-        x, y = rng.randint(0, width), rng.randint(0, height)
-        b = rng.randint(90, 140)
-        img[y, x] = [b, int(b * 0.85), int(b * 0.65)]
-
-    for _ in range(25):
-        x0, y0 = rng.randint(0, width), rng.randint(0, height)
-        angle = rng.uniform(0, np.pi)
-        for t in range(rng.randint(10, 35)):
-            px = int(x0 + t * np.cos(angle))
-            py = int(y0 + t * np.sin(angle))
-            if 0 <= px < width and 0 <= py < height:
-                img[py, px] = (img[py, px] * 0.4).astype(np.uint8)
-    return img
-
-
 # ---------------------------------------------------------------------------
-# Gentle CPG for stable walking
+# Walking controller using real recorded kinematics
 # ---------------------------------------------------------------------------
-class SimpleCPG:
-    """Minimal CPG for tripod gait.
+class WalkingController:
+    """Loops recorded walking kinematics with turning modulation."""
 
-    Per-leg DOF layout (7 DOFs each):
-      [0] coxa-yaw       (turning left/right)
-      [1] coxa-pitch      (forward/back swing)
-      [2] coxa-roll
-      [3] femur-pitch     (lift/lower leg)
-      [4] femur-roll
-      [5] tibia-pitch     (extend/retract)
-      [6] tarsus1-pitch
-    """
+    def __init__(self, fly, sim_timestep):
+        snippet = MotionSnippet()
+        dof_order = fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
+        self.joint_angles = snippet.get_joint_angles(
+            output_timestep=sim_timestep,
+            output_dof_order=dof_order,
+        )
+        self.n_steps = self.joint_angles.shape[0]
+        self.n_dofs = self.joint_angles.shape[1]
+        self.dpl = self.n_dofs // 6
+        self.idx = 0
 
-    def __init__(self, n_actuated_dofs, timestep, freq=12.0):
-        self.n_dofs = n_actuated_dofs
-        self.timestep = timestep
-        self.freq = freq
-        self.phase = 0.0
-        self.dpl = n_actuated_dofs // 6  # 7 DOFs per leg
+    def step(self, turn_bias=0.0):
+        """Return target joint angles for this timestep."""
+        angles = self.joint_angles[self.idx % self.n_steps].copy()
 
-    def step(self, neutral_ctrl, turn_bias=0.0):
-        self.phase += 2 * np.pi * self.freq * self.timestep
-        offsets = np.zeros(self.n_dofs)
-
+        # Apply turning: modulate coxa-pitch (DOF index 1 per leg) amplitude
         for leg_idx in range(6):
-            leg_phase = self.phase + (0 if leg_idx % 2 == 0 else np.pi)
             b = leg_idx * self.dpl
-            sin_p = np.sin(leg_phase)
-            swing_up = max(0, sin_p)
+            if leg_idx < 3:  # left legs
+                angles[b + 1] *= (1.0 + turn_bias * 0.3)
+            else:  # right legs
+                angles[b + 1] *= (1.0 - turn_bias * 0.3)
 
-            # [1] Coxa PITCH — forward/back swing
-            swing = 0.5 * sin_p
-            if leg_idx < 3:
-                swing *= (1.0 + turn_bias * 0.4)
-            else:
-                swing *= (1.0 - turn_bias * 0.4)
-            offsets[b + 1] = swing
-
-            # [3] Femur PITCH — lift leg during swing
-            offsets[b + 3] = -0.6 * swing_up
-
-            # [5] Tibia PITCH — extend during swing
-            offsets[b + 5] = 0.3 * swing_up
-
-            # [0] Coxa YAW — steering
-            offsets[b + 0] = turn_bias * 0.08
-
-        return neutral_ctrl + offsets
+        self.idx += 1
+        return angles
 
 
 # ---------------------------------------------------------------------------
@@ -335,18 +225,17 @@ def make_fly(name):
         axis_order=AxisOrder.YAW_PITCH_ROLL,
         joint_preset=JointPreset.LEGS_ONLY,
     )
-    neutral_pose = KinematicPosePreset.NEUTRAL
-    fly.add_joints(skeleton, neutral_pose=neutral_pose)
+    fly.add_joints(skeleton, neutral_pose=KinematicPosePreset.NEUTRAL)
     actuated_dofs = skeleton.get_actuated_dofs_from_preset(
         ActuatedDOFPreset.LEGS_ACTIVE_ONLY
     )
     fly.add_actuators(
         actuated_dofs, ActuatorType.POSITION,
-        kp=50.0, neutral_input=neutral_pose, ctrlrange=(-3.14, 3.14),
+        kp=150.0, neutral_input=KinematicPosePreset.NEUTRAL,
+        ctrlrange=(-3.14, 3.14),
     )
     fly.add_leg_adhesion()
     fly.colorize()
-    fly.add_tracking_camera(name=f"{name}_cam")
     return fly
 
 
@@ -356,103 +245,71 @@ def make_fly(name):
 def main() -> int:
     timestep = 1e-4
     num_flies = 3
-    # Physics runs at 10x real-time so fly movement is visible
-    # (flies are ~2mm long and walk ~1.5mm/s — invisible at 1:1)
-    # 1 wall-second = 10 simulated seconds
-    realtime_factor = 10.0
+    realtime_factor = 5.0  # 5x speed so movement is visible
 
-    # Quaternions for rotation around Z axis only (w, x, y, z):
-    # (1,0,0,0) = forward, (cos(a/2),0,0,sin(a/2)) = yaw by angle a
-    spawn_configs = [
-        ((0, 0, 0.7), Rotation3D("quat", (1, 0, 0, 0))),             # facing +x
-        ((8, -6, 0.7), Rotation3D("quat", (0.924, 0, 0, 0.383))),    # ~45° yaw
-        ((-5, 4, 0.7), Rotation3D("quat", (0.707, 0, 0, -0.707))),   # ~-90° yaw
+    spawns = [
+        ((0, 0, 0.7), Rotation3D("quat", (1, 0, 0, 0))),
+        ((3, -2, 0.7), Rotation3D("quat", (0.924, 0, 0, 0.383))),
+        ((-2, 2, 0.7), Rotation3D("quat", (0.924, 0, 0, -0.383))),
     ]
 
     world = ForestFloorWorld()
 
-    # Monkey-patch multi-fly neutral keyframe conflict
-    import flygym.compose.world as _world_mod
-    def _patched_rebuild(self):
-        mj_model, _ = self.compile()
-        neutral_qpos = np.zeros(mj_model.nq)
-        neutral_ctrl = np.zeros(mj_model.nu)
-        all_world_joints = {
-            j.full_identifier: j for j in self.mjcf_root.find_all("joint")
-        }
-        for joint_name, neutral_state in self.world_dof_neutral_states.items():
-            joint_element = all_world_joints.get(joint_name)
-            if joint_element is None:
-                continue
-            joint_type = "free" if joint_element.tag == "freejoint" else joint_element.type
-            internal_jointid = mj.mj_name2id(
-                mj_model, mj.mjtObj.mjOBJ_JOINT, joint_element.full_identifier
-            )
-            adr = mj_model.jnt_dofadr[internal_jointid]
-            end = adr + _world_mod._STATE_DIM_BY_JOINT_TYPE[joint_type]
-            neutral_qpos[adr:end] = neutral_state
-        for fly_name, fly in self.fly_lookup.items():
-            qpos = fly._get_neutral_qpos(mj_model)
-            idx = qpos.nonzero()
-            neutral_qpos[idx] = qpos[idx]
-            ctrl = fly._get_neutral_ctrl(mj_model)
-            idx = ctrl.nonzero()
-            neutral_ctrl[idx] = ctrl[idx]
-        self._neutral_keyframe.qpos = neutral_qpos
-        self._neutral_keyframe.ctrl = neutral_ctrl
-    _world_mod.BaseWorld._rebuild_neutral_keyframe = _patched_rebuild
+    # Multi-fly keyframe patch
+    import flygym.compose.world as _wm
+    _orig = _wm.BaseWorld._rebuild_neutral_keyframe
+    def _fix(self):
+        mm, _ = self.compile()
+        nq, nc = np.zeros(mm.nq), np.zeros(mm.nu)
+        aj = {j.full_identifier: j for j in self.mjcf_root.find_all("joint")}
+        for jn, ns in self.world_dof_neutral_states.items():
+            je = aj.get(jn)
+            if not je: continue
+            jt = "free" if je.tag == "freejoint" else je.type
+            jid = mj.mj_name2id(mm, mj.mjtObj.mjOBJ_JOINT, je.full_identifier)
+            a = mm.jnt_qposadr[jid]
+            nq[a:a + _wm._STATE_DIM_BY_JOINT_TYPE[jt]] = ns
+        for fn, f in self.fly_lookup.items():
+            q = f._get_neutral_qpos(mm); nq[q.nonzero()] = q[q.nonzero()]
+            c = f._get_neutral_ctrl(mm); nc[c.nonzero()] = c[c.nonzero()]
+        self._neutral_keyframe.qpos = nq; self._neutral_keyframe.ctrl = nc
+    _wm.BaseWorld._rebuild_neutral_keyframe = _fix
 
-    # Build flies
     flies = []
-    for i in range(num_flies):
+    for i, (pos, rot) in enumerate(spawns):
         fly = make_fly(f"fly_{i}")
-        pos, rot = spawn_configs[i]
         world.add_fly(fly, pos, rot)
         flies.append(fly)
 
     sim = Simulation(world)
     sim.reset()
-    sim.warmup(duration_s=0.02)
+    sim.warmup(duration_s=0.05)
 
-    # Visuals
     world.upload_texture(sim.mj_model)
     world.apply_atmosphere(sim.mj_model)
 
-    # Adhesion on
     for fly in flies:
         sim.set_leg_adhesion_states(fly.name, np.ones(6, dtype=bool))
 
-    # CPGs + neutral ctrl values (the actuator targets at the standing pose)
-    cpgs = {}
-    neutral_ctrls = {}
-    rng = np.random.RandomState(123)
-    for fly in flies:
-        n_act = len(fly.get_actuated_jointdofs_order(ActuatorType.POSITION))
-        cpgs[fly.name] = SimpleCPG(n_act, timestep)
-        # Grab this fly's neutral ctrl from the compiled data
-        # (set_actuator_inputs expects absolute angles, not offsets)
-        act_ids = sim._intern_actuatorids_by_type_by_fly[ActuatorType.POSITION][fly.name]
-        neutral_ctrls[fly.name] = sim.mj_data.ctrl[act_ids].copy()
-
+    # Walking controllers (using real recorded kinematics)
+    controllers = {fly.name: WalkingController(fly, timestep) for fly in flies}
     turn_biases = {fly.name: 0.0 for fly in flies}
+    rng = np.random.RandomState(123)
     turn_update_steps = int(0.5 / timestep)
 
-    # Food manager
-    food_mgr = FoodManager(sim.mj_model, sim.mj_data, MAX_FOOD, food_radius=0.4,
-                           spawn_range=25.0, spawn_interval_s=3.0, despawn_dist=2.0)
+    # Food
+    food_mgr = FoodManager(sim.mj_model, sim.mj_data, spawn_range=10.0)
     food_update_steps = int(1.0 / timestep)
 
-    # Launch viewer
+    # Viewer
     viewer = mjviewer.launch_passive(
         sim.mj_model, sim.mj_data,
-        show_left_ui=True, show_right_ui=True,
-    )
+        show_left_ui=True, show_right_ui=True)
 
     for i in range(sim.mj_model.ntex):
         name = mj.mj_id2name(sim.mj_model, mj.mjtObj.mjOBJ_TEXTURE, i)
         if name == world._forest_tex_name:
-            viewer.update_texture(i)
-            break
+            viewer.update_texture(i); break
 
     viewer.cam.type = mj.mjtCamera.mjCAMERA_FREE
     viewer.cam.distance = 15.0
@@ -460,94 +317,65 @@ def main() -> int:
     viewer.cam.azimuth = 135.0
     viewer.cam.lookat[:] = [0, 0, 0]
 
-    print("=" * 65)
-    print("  NeuroMechFly v2 — Forest Floor Simulation")
-    print(f"  {num_flies} flies | food spawns randomly every ~3s")
-    print("  Orbit/zoom/pan with mouse. Close window or Ctrl+C to stop.")
-    print("=" * 65)
+    print("=" * 60)
+    print("  NeuroMechFly v2 — Forest Floor")
+    print(f"  {num_flies} flies | real walking kinematics | {realtime_factor}x speed")
+    print("  Close window or Ctrl+C to stop.")
+    print("=" * 60)
 
     step_count = 0
-    metrics_interval = int(1.0 / timestep)
-    sync_interval = 200  # sync viewer every N steps
+    sync_interval = 500
+    metrics_interval = int(2.0 / timestep)
     wall_start = time.perf_counter()
-    sim_start = 0.0
 
     try:
         while viewer.is_running():
-            # --- Turning decisions ---
             if step_count % turn_update_steps == 0:
                 food_pos = food_mgr.get_active_positions()
                 for fly in flies:
-                    body_pos = sim.get_body_positions(fly.name)
-                    fly_xy = body_pos[0, :2]
-
+                    bp = sim.get_body_positions(fly.name)
+                    xy = bp[0, :2]
                     if len(food_pos) > 0:
-                        dists = np.linalg.norm(food_pos - fly_xy, axis=1)
-                        nearest = food_pos[np.argmin(dists)]
-                        to_food = nearest - fly_xy
-
-                        body_rot = sim.get_body_rotations(fly.name)
-                        quat = body_rot[0]
-                        fwd_x = 1 - 2 * (quat[2]**2 + quat[3]**2)
-                        fwd_y = 2 * (quat[1]*quat[2] + quat[0]*quat[3])
-                        cross = fwd_x * to_food[1] - fwd_y * to_food[0]
+                        dists = np.linalg.norm(food_pos - xy, axis=1)
+                        to_food = food_pos[np.argmin(dists)] - xy
+                        rot = sim.get_body_rotations(fly.name)
+                        q = rot[0]
+                        fx = 1 - 2*(q[2]**2+q[3]**2)
+                        fy = 2*(q[1]*q[2]+q[0]*q[3])
+                        cross = fx*to_food[1] - fy*to_food[0]
                         turn_biases[fly.name] = np.clip(cross * 0.15, -0.8, 0.8)
                     else:
                         turn_biases[fly.name] = rng.uniform(-0.3, 0.3)
 
-            # --- CPG control ---
             for fly in flies:
-                ctrl = cpgs[fly.name].step(
-                    neutral_ctrls[fly.name], turn_biases[fly.name]
-                )
-                sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, ctrl)
+                angles = controllers[fly.name].step(turn_biases[fly.name])
+                sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
 
             sim.step()
             step_count += 1
 
-            # --- Food updates ---
             if step_count % food_update_steps == 0:
-                fly_positions = []
-                for fly in flies:
-                    bp = sim.get_body_positions(fly.name)
-                    fly_positions.append(bp[0])
-                food_mgr.update(step_count * timestep, fly_positions)
+                fps = [sim.get_body_positions(f.name)[0] for f in flies]
+                food_mgr.update(fps)
 
-            # --- Viewer sync + pacing ---
             if step_count % sync_interval == 0:
                 viewer.sync()
-                # Pace to realtime_factor
-                sim_elapsed = step_count * timestep
-                wall_elapsed = time.perf_counter() - wall_start
-                target_wall = sim_elapsed / realtime_factor
-                if wall_elapsed < target_wall:
-                    time.sleep(target_wall - wall_elapsed)
+                sim_t = step_count * timestep
+                wall_t = time.perf_counter() - wall_start
+                target = sim_t / realtime_factor
+                if wall_t < target:
+                    time.sleep(target - wall_t)
 
-            # --- Metrics ---
             if step_count % metrics_interval == 0:
-                sim_time = step_count * timestep
-                food_pos = food_mgr.get_active_positions()
-                n_food = len(food_pos)
-                print(f"\n--- t={sim_time:.1f}s  food={n_food} ---")
+                sim_t = step_count * timestep
+                fp = food_mgr.get_active_positions()
+                print(f"\n--- t={sim_t:.0f}s  food={len(fp)} ---")
                 for fly in flies:
                     bp = sim.get_body_positions(fly.name)
-                    xyz = bp[0]
-                    contact_active, forces, *_ = sim.get_ground_contact_info(fly.name)
-                    legs = int(contact_active.sum())
-                    grf = np.linalg.norm(forces, axis=1).sum()
-
-                    if len(food_pos) > 0:
-                        dists = np.linalg.norm(food_pos - xyz[:2], axis=1)
-                        fd = dists.min()
-                    else:
-                        fd = float('inf')
-
-                    print(
-                        f"  {fly.name}: "
-                        f"({xyz[0]:+6.1f},{xyz[1]:+6.1f},{xyz[2]:4.2f}) "
-                        f"legs={legs}/6 grf={grf:5.0f} "
-                        f"food={fd:5.1f}mm"
-                    )
+                    ca, fo, *_ = sim.get_ground_contact_info(fly.name)
+                    fd = np.linalg.norm(fp - bp[0,:2], axis=1).min() if len(fp) else 999
+                    print(f"  {fly.name}: ({bp[0,0]:+6.1f},{bp[0,1]:+6.1f},{bp[0,2]:.2f}) "
+                          f"legs={int(ca.sum())}/6 food={fd:.1f}mm")
 
     except KeyboardInterrupt:
         print("\nStopped.")
