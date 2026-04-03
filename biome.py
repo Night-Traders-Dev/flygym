@@ -372,10 +372,9 @@ class BiomeWorld(FlatGroundWorld):
 
         super().__init__(name=name, half_size=half)
 
-        self.ground_geom.contype = 0
-        self.ground_geom.conaffinity = 0
-        # Push parent plane below zone boxes to avoid z-fighting
-        self.ground_geom.pos = (0, 0, -0.6)
+        # Keep parent's infinite ground plane for physics collision (it works reliably)
+        # Zone boxes are visual only (sit slightly above the collision plane)
+        self.ground_geom.pos = (0, 0, -0.01)  # collision plane just below z=0
         # Restyle to neutral earth (visible in gaps between zones)
         dirt_tex = self.mjcf_root.asset.add(
             "texture", name="tex_dirt_fill", type="2d", builtin="flat",
@@ -419,7 +418,7 @@ class BiomeWorld(FlatGroundWorld):
                     size=(zone_size / 2, zone_size / 2, 0.25),
                     material=created_materials[biome.name],
                     friction=biome.friction,
-                    contype=1, conaffinity=1,  # native collision — no explicit pairs needed
+                    contype=0, conaffinity=0,  # visual only — collision via parent ground plane
                 )
                 self._zone_geoms[(row, col)] = geom
 
@@ -476,29 +475,42 @@ class BiomeWorld(FlatGroundWorld):
             wg = self.mjcf_root.worldbody.add(
                 "geom", type="box", name=wname,
                 pos=wpos, size=wsize,
-                rgba=wall_rgba, contype=1, conaffinity=1,
+                rgba=wall_rgba, contype=0, conaffinity=0,
             )
             self._wall_geoms.append(wg)
 
     # --- Multi-fly contact overrides ---
 
     def _set_ground_contact(self, fly, bodysegs, params):
-        # Zone geoms use contype=1/conaffinity=1 for native MuJoCo collision
-        # (no explicit pairs needed — much faster than O(zones*bodysegs) pairs)
-        # Just set fly body geoms to also have contype=1, conaffinity=1
+        # Use parent's ground plane for collision (reliable, fast, single geom)
+        # Zone boxes and scatter objects are visual only (contype=0)
         for bs in bodysegs:
             fly_geom = fly.mjcf_root.find("geom", bs.name)
-            fly_geom.contype = 1
-            fly_geom.conaffinity = 1
-
-        # Wall contacts (also native — walls already have contype=1)
-        # Walls set below
+            self.mjcf_root.contact.add(
+                "pair", geom1=fly_geom, geom2=self.ground_geom,
+                name=f"{fly.name}_{bs.name}-ground",
+                friction=params.get_friction_tuple(),
+                solref=params.get_solref_tuple(),
+                solimp=params.get_solimp_tuple(),
+                margin=params.margin,
+            )
+        # Wall contacts via explicit pairs
+        for wg in self._wall_geoms:
+            for bs in bodysegs:
+                fly_geom = fly.mjcf_root.find("geom", bs.name)
+                self.mjcf_root.contact.add(
+                    "pair", geom1=fly_geom, geom2=wg,
+                    name=f"{fly.name}_{bs.name}-{wg.name}",
+                    friction=(1.0, 0.005, 0.0001, 0.001, 0.001),
+                    solref=params.get_solref_tuple(),
+                    solimp=params.get_solimp_tuple(),
+                    margin=params.margin,
+                )
 
     def _add_ground_contact_sensors(self, fly, bodysegs):
         if self.legpos_to_groundcontactsensors_by_fly is None:
             self.legpos_to_groundcontactsensors_by_fly = defaultdict(dict)
-        center_row, center_col = self.nrows // 2, self.ncols // 2
-        ref_geom = self._zone_geoms[(center_row, center_col)]
+        ref_geom = self.ground_geom  # use parent's collision plane
         by_leg = defaultdict(list)
         for bs in bodysegs:
             if bs.is_leg(): by_leg[bs.pos].append(bs)

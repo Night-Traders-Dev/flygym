@@ -347,44 +347,14 @@ def main() -> int:
                     else:
                         turn_biases[fly.name] = rng.uniform(-0.3, 0.3)
 
-                    # Flight decision: fly if food is far and energy is adequate
-                    should_fly = (
-                        food_dist > 8.0
-                        and v.energy > 30
-                        and v.hunger < 50
-                        and v.alive
-                    )
+                    # TODO: Flight disabled — NaN instability during walk-to-flight
+                    # transition in biome world. Flight works on FlatGroundWorld.
+                    # See flight.py for the PD controller that achieves stable hover.
 
-                    if should_fly and not fc.is_flying:
-                        fc.start_flying()
-                        # Disable adhesion during flight
-                        sim.set_leg_adhesion_states(fly.name, np.zeros(6, dtype=bool))
-                    elif (not should_fly or food_dist < 3.0) and fc.is_flying:
-                        fc.stop_flying()
-                        # Re-enable adhesion for walking
-                        am = effects.get_adhesion_modifier(fly.name)
-                        sim.set_leg_adhesion_states(fly.name, np.ones(6, dtype=bool) * am)
-
-            # --- Walk or fly ---
+            # --- Walk ---
             for fly in flies:
-                fc = flight_ctrls[fly.name]
-                if fc.is_flying:
-                    # Flight mode: wing controller + aerodynamics
-                    move_dir = None
-                    food_pos = food_mgr.get_active_positions()
-                    if len(food_pos) > 0:
-                        bp = sim.get_body_positions(fly.name)
-                        dists = np.linalg.norm(food_pos - bp[0, :2], axis=1)
-                        to_food = food_pos[np.argmin(dists)] - bp[0, :2]
-                        move_dir = to_food * 0.01  # gentle direction bias
-                    fc.step(move_direction=move_dir, turn=turn_biases[fly.name])
-                    # Still send walking angles to keep legs in a neutral pose
-                    angles = controllers[fly.name].step(0)
-                    sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
-                else:
-                    # Walking mode
-                    angles = controllers[fly.name].step(turn_biases[fly.name])
-                    sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
+                angles = controllers[fly.name].step(turn_biases[fly.name])
+                sim.set_actuator_inputs(fly.name, ActuatorType.POSITION, angles)
 
             sim.step()
             step_count += 1
